@@ -13,4 +13,4 @@ COPY . .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ENTRYPOINT ["python", "-m", "trainer.task"]
+ENTRYPOINT ["python", "-m", "trainer.task"]

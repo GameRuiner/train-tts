@@ -25,7 +25,7 @@ def preprocess_dataset(
     # Load dataset
     print("Loading dataset...")
     dataset = load_dataset(
-        path="amu-cai/pl-asr-bigos-v2", name=dataset_name, split="train"
+        path="amu-cai/pl-asr-bigos-v2", name=dataset_name, split="train", trust_remote_code=True
     )
     
     # Get available splits
