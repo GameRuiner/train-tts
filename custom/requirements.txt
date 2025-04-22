@@ -1,5 +1,5 @@
 soundfile==0.12.1
 transformers==4.45.2
-xcodec2==0.1.3
+xcodec2
 python-dotenv
 google-cloud-aiplatform

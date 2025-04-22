@@ -11,6 +11,7 @@ PROJECT_ID = environ["PROJECT_ID"]
 LOCATION = environ["LOCATION"]
 BUCKET_URI = environ["BUCKET_URI"]
 HfFolder.save_token(environ["HF_TOKEN"])
+environ["GOOGLE_APPLICATION_CREDENTIALS"] = "text-to-speech-451918-8309307a12ed.json"
 
 aiplatform.init(project=PROJECT_ID, location=LOCATION, staging_bucket=BUCKET_URI)
 
