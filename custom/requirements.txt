@@ -4,6 +4,9 @@ google-cloud-aiplatform
 transformers
 tokenizers
 
+bitsandbytes==0.45.5
+liger_kernel==0.5.8
+
 accelerate==1.1.0
 aiohappyeyeballs==2.4.0
 aiohttp==3.10.5

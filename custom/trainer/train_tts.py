@@ -1,5 +1,6 @@
 import os
 import json
+import glob
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -60,27 +61,70 @@ class TTSDataset(Dataset):
         data_path,
         split,
         tokenizer,
-        ranks: Optional[List[int]] = None,
-        partials: Optional[List[int]] = None,
     ):
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
         self.max_length = 2048
         self.ignore_index = -100
+        print("Loading dataset...")
+        # Use glob to search for files matching pattern for any rank and partial.
+        pattern = os.path.join(data_path, f"{split}_rank*_partial*_input_ids.memmap")
+        memmap_files = sorted(glob.glob(pattern))
 
-        # If no chunks were found, fall back to a single file strategy.
-        if len(self.chunks) == 0:
-            memmap_file = os.path.join(data_path, f'{split}_input_ids.memmap')
-            shape_file = os.path.join(data_path, f'{split}_input_ids_shape.npy')
-            shape = tuple(np.load(shape_file))
-            self.single_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
-            self.length = shape[0]
-            self.chunks = [self.single_memmap]
-            self.cum_lengths = [0, self.length]
-        else:
+        print(f"Found {len(memmap_files)} matching files for {split} split")
+        print(f"memmap_files: {memmap_files}")
+
+        self.chunks = []
+        self.cum_lengths = [0]
+
+        # If any matching files are found, load each one together with its shape.
+        if memmap_files:
+            for memmap_file in memmap_files:
+                # Replace "input_ids.memmap" with "input_ids_shape.npy"
+                shape_file = memmap_file.replace("input_ids.memmap", "input_ids_shape.npy")
+                if not os.path.exists(shape_file):
+                    raise ValueError(f"Shape file {shape_file} not found for {memmap_file}")
+                shape = tuple(np.load(shape_file))
+                chunk_memmap = np.memmap(
+                    memmap_file, dtype="int32", mode="r", shape=shape
+                )
+                self.chunks.append(chunk_memmap)
+                self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
             self.length = self.cum_lengths[-1]
+            print(f"Total length: {self.length}")
+            print(f"cum_lengths: {self.cum_lengths}")
+            print(f"chunks: {self.chunks}")
+        else:
+            # Fall back to the previous naming convention if no rank/partial files found.
+            chunk_idx = 0
+            self.chunks = []
+            self.cum_lengths = [0]
+            while True:
+                memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
+                shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
+                if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
+                    break
+                shape = tuple(np.load(shape_file))
+                chunk_memmap = np.memmap(
+                    memmap_file, dtype="int32", mode="r", shape=shape
+                )
+                self.chunks.append(chunk_memmap)
+                self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+                chunk_idx += 1
 
-        # These IDs remain the same.
+            if len(self.chunks) == 0:
+                # Fallback to a single file strategy.
+                memmap_file = os.path.join(data_path, f'{split}_input_ids.memmap')
+                shape_file = os.path.join(data_path, f'{split}_input_ids_shape.npy')
+                shape = tuple(np.load(shape_file))
+                self.single_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
+                self.length = shape[0]
+                self.chunks = [self.single_memmap]
+                self.cum_lengths = [0, self.length]
+            else:
+                self.length = self.cum_lengths[-1]
+
+        # Retrieve the special tokens.
         self.speech_generation_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_START|>')
         self.speech_generation_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_END|>')
         self.text_generation_start_id = tokenizer.convert_tokens_to_ids('<|TEXT_GENERATION_START|>')
@@ -89,7 +133,6 @@ class TTSDataset(Dataset):
         self.text_understanding_end_id = tokenizer.convert_tokens_to_ids('<|TEXT_UNDERSTANDING_END|>')
         self.speech_understanding_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_UNDERSTANDING_START|>')
         self.speech_understanding_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_UNDERSTANDING_END|>')
- 
         self.max_length = 2048
         self.ignore_index = -100  
 
@@ -97,12 +140,7 @@ class TTSDataset(Dataset):
         return self.length
 
     def get_chunk_and_local_index(self, idx):
-        """
-        Given a global sample index, determine which chunk this sample lies in,
-        and return the chunk (memmap array) and the local index.
-        """
-        # Binary search could be used here, but given the small number of chunks, a
-        # linear iteration is sufficient.
+        # Find in which chunk the global index resides.
         for i in range(1, len(self.cum_lengths)):
             if idx < self.cum_lengths[i]:
                 local_idx = idx - self.cum_lengths[i - 1]
@@ -128,10 +166,8 @@ class TTSDataset(Dataset):
         tokenizer,
         num_samples=None,
         seed=None,
-        ranks: Optional[List[int]] = None,
-        partials: Optional[List[int]] = None,
     ):
-        dataset = cls(data_path, split, tokenizer, ranks=ranks, partials=partials)
+        dataset = cls(data_path, split, tokenizer)
         if num_samples is not None:
             # Set random seed for reproducibility.
             if seed is not None:
@@ -168,7 +204,6 @@ class TTSDataset(Dataset):
             speech_gen_end_idx = (input_ids == self.speech_generation_end_id).nonzero(as_tuple=True)[0].item()
         except Exception as e:
             print(f"maybe Error in speech_gen_end_idx: {e}")
-            # speech_gen_end_idx = len(input_ids) - 1
             speech_gen_end_idx = 2048
  
         text_sequence = input_ids[:speech_gen_idx]
@@ -183,8 +218,6 @@ class TTSDataset(Dataset):
     
         ids = self.replace_tagged_token(ids, self.text_understanding_start_id, text_sequence)
         ids = self.replace_tagged_token(ids, self.speech_generation_start_id, speech_sequence)
-
-
 
         input_ids = torch.tensor(ids, dtype=torch.long)
         labels = torch.full_like(input_ids, self.ignore_index)
