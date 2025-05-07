@@ -26,6 +26,10 @@ from functools import partial
 import bitsandbytes as bnb
 from transformers.trainer_pt_utils import get_parameter_names
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
+from google.cloud import storage
+import tempfile
+from os import environ
+from dotenv import load_dotenv
 
 @dataclass
 class ModelArguments:
@@ -61,11 +65,15 @@ class TTSDataset(Dataset):
         data_path,
         split,
         tokenizer,
+        from_gcs=True,
     ):
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
         self.max_length = 2048
         self.ignore_index = -100
+        self.chunks = []
+        self.cum_lengths = [0]
+        self.temp_files = []
         print("Loading dataset...")
         # Use glob to search for files matching pattern for any rank and partial.
         pattern = os.path.join(data_path, f"{split}_rank*_partial*_input_ids.memmap")
@@ -74,55 +82,105 @@ class TTSDataset(Dataset):
         print(f"Found {len(memmap_files)} matching files for {split} split")
         print(f"memmap_files: {memmap_files}")
 
-        self.chunks = []
-        self.cum_lengths = [0]
-
-        # If any matching files are found, load each one together with its shape.
-        if memmap_files:
-            for memmap_file in memmap_files:
-                # Replace "input_ids.memmap" with "input_ids_shape.npy"
-                shape_file = memmap_file.replace("input_ids.memmap", "input_ids_shape.npy")
-                if not os.path.exists(shape_file):
-                    raise ValueError(f"Shape file {shape_file} not found for {memmap_file}")
-                shape = tuple(np.load(shape_file))
-                chunk_memmap = np.memmap(
-                    memmap_file, dtype="int32", mode="r", shape=shape
-                )
-                self.chunks.append(chunk_memmap)
-                self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
-            self.length = self.cum_lengths[-1]
-            print(f"Total length: {self.length}")
-            print(f"cum_lengths: {self.cum_lengths}")
-            print(f"chunks: {self.chunks}")
-        else:
-            # Fall back to the previous naming convention if no rank/partial files found.
-            chunk_idx = 0
-            self.chunks = []
-            self.cum_lengths = [0]
+        if from_gcs:
+            storage_client = storage.Client()
+            bucket_uri = os.getenv("BUCKET_URI")
+            bucket = storage_client.bucket(bucket_uri.replace("gs://", ""))
+            
+            idx = 0
             while True:
-                memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
-                shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
-                if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
+                memmap_blob_name = f"{split}_input_ids_{idx}.memmap"
+                shape_blob_name = f"{split}_input_ids_{idx}_shape.npy"
+                memmap_blob = bucket.blob(memmap_blob_name)
+                shape_blob = bucket.blob(shape_blob_name)
+
+                if not memmap_blob.exists() or not shape_blob.exists():
                     break
-                shape = tuple(np.load(shape_file))
-                chunk_memmap = np.memmap(
-                    memmap_file, dtype="int32", mode="r", shape=shape
-                )
-                self.chunks.append(chunk_memmap)
-                self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
-                chunk_idx += 1
+
+                # Download shape to memory
+                with tempfile.NamedTemporaryFile(delete=False) as shape_tmp_file:
+                    shape_blob.download_to_filename(shape_tmp_file.name)
+                    shape = tuple(np.load(shape_tmp_file.name))
+                    self.temp_files.append(shape_tmp_file.name)
+
+                # Download memmap file to temp and load
+                with tempfile.NamedTemporaryFile(delete=False) as memmap_tmp_file:
+                    memmap_blob.download_to_filename(memmap_tmp_file.name)
+                    self.temp_files.append(memmap_tmp_file.name)
+                    chunk_memmap = np.memmap(
+                        memmap_tmp_file.name, dtype='int32', mode='r', shape=shape
+                    )
+                    self.chunks.append(chunk_memmap)
+                    self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+
+                idx += 1
 
             if len(self.chunks) == 0:
-                # Fallback to a single file strategy.
-                memmap_file = os.path.join(data_path, f'{split}_input_ids.memmap')
-                shape_file = os.path.join(data_path, f'{split}_input_ids_shape.npy')
-                shape = tuple(np.load(shape_file))
-                self.single_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
-                self.length = shape[0]
-                self.chunks = [self.single_memmap]
-                self.cum_lengths = [0, self.length]
-            else:
+                # Try single file fallback
+                memmap_blob = bucket.blob(f"{split}_input_ids.memmap")
+                shape_blob = bucket.blob(f"{split}_input_ids_shape.npy")
+                with tempfile.NamedTemporaryFile(delete=False) as shape_tmp_file:
+                    shape_blob.download_to_filename(shape_tmp_file.name)
+                    shape = tuple(np.load(shape_tmp_file.name))
+                    self.temp_files.append(shape_tmp_file.name)
+
+                with tempfile.NamedTemporaryFile(delete=False) as memmap_tmp_file:
+                    memmap_blob.download_to_filename(memmap_tmp_file.name)
+                    self.temp_files.append(memmap_tmp_file.name)
+                    chunk_memmap = np.memmap(
+                        memmap_tmp_file.name, dtype='int32', mode='r', shape=shape
+                    )
+                    self.chunks.append(chunk_memmap)
+                    self.cum_lengths = [0, shape[0]]
+
+            self.length = self.cum_lengths[-1]
+        else: 
+        # If any matching files are found, load each one together with its shape.
+            if memmap_files:
+                for memmap_file in memmap_files:
+                    # Replace "input_ids.memmap" with "input_ids_shape.npy"
+                    shape_file = memmap_file.replace("input_ids.memmap", "input_ids_shape.npy")
+                    if not os.path.exists(shape_file):
+                        raise ValueError(f"Shape file {shape_file} not found for {memmap_file}")
+                    shape = tuple(np.load(shape_file))
+                    chunk_memmap = np.memmap(
+                        memmap_file, dtype="int32", mode="r", shape=shape
+                    )
+                    self.chunks.append(chunk_memmap)
+                    self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
                 self.length = self.cum_lengths[-1]
+                print(f"Total length: {self.length}")
+                print(f"cum_lengths: {self.cum_lengths}")
+                print(f"chunks: {self.chunks}")
+            else:
+                # Fall back to the previous naming convention if no rank/partial files found.
+                chunk_idx = 0
+                self.chunks = []
+                self.cum_lengths = [0]
+                while True:
+                    memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
+                    shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
+                    if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
+                        break
+                    shape = tuple(np.load(shape_file))
+                    chunk_memmap = np.memmap(
+                        memmap_file, dtype="int32", mode="r", shape=shape
+                    )
+                    self.chunks.append(chunk_memmap)
+                    self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+                    chunk_idx += 1
+
+                if len(self.chunks) == 0:
+                    # Fallback to a single file strategy.
+                    memmap_file = os.path.join(data_path, f'{split}_input_ids.memmap')
+                    shape_file = os.path.join(data_path, f'{split}_input_ids_shape.npy')
+                    shape = tuple(np.load(shape_file))
+                    self.single_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
+                    self.length = shape[0]
+                    self.chunks = [self.single_memmap]
+                    self.cum_lengths = [0, self.length]
+                else:
+                    self.length = self.cum_lengths[-1]
 
         # Retrieve the special tokens.
         self.speech_generation_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_START|>')
@@ -252,6 +310,11 @@ class TTSDataset(Dataset):
  
 
 def main():
+    load_dotenv()
+    PROJECT_ID = environ["PROJECT_ID"]
+    LOCATION = environ["LOCATION"]
+    BUCKET_URI = environ["BUCKET_URI"]
+    environ["GOOGLE_APPLICATION_CREDENTIALS"] = "trainer/text-to-speech-451918-8309307a12ed.json"
     # Parse arguments
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, CustomTrainingArguments))
@@ -363,6 +426,7 @@ def main():
         data_path=data_args.data_path,
         split="train",
         tokenizer=tokenizer,
+        from_gcs=True
         # ranks=[0, 1],
         # partials=[0, 1],
     )
