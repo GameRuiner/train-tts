@@ -65,7 +65,6 @@ class TTSDataset(Dataset):
         data_path,
         split,
         tokenizer,
-        from_gcs=True,
     ):
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
@@ -82,13 +81,12 @@ class TTSDataset(Dataset):
         print(f"Found {len(memmap_files)} matching files for {split} split")
         print(f"memmap_files: {memmap_files}")
 
-        if from_gcs:
-            storage_client = storage.Client()
-            bucket_uri = os.getenv("BUCKET_URI")
-            bucket = storage_client.bucket(bucket_uri.replace("gs://", ""))
+        storage_client = storage.Client()
+        bucket_uri = os.getenv("BUCKET_URI")
+        bucket = storage_client.bucket(bucket_uri.replace("gs://", ""))
             
-            idx = 0
-            while True:
+        idx = 0
+        while True:
                 memmap_blob_name = f"{split}_input_ids_{idx}.memmap"
                 shape_blob_name = f"{split}_input_ids_{idx}_shape.npy"
                 memmap_blob = bucket.blob(memmap_blob_name)
@@ -115,7 +113,7 @@ class TTSDataset(Dataset):
 
                 idx += 1
 
-            if len(self.chunks) == 0:
+        if len(self.chunks) == 0:
                 # Try single file fallback
                 memmap_blob = bucket.blob(f"{split}_input_ids.memmap")
                 shape_blob = bucket.blob(f"{split}_input_ids_shape.npy")
@@ -133,55 +131,7 @@ class TTSDataset(Dataset):
                     self.chunks.append(chunk_memmap)
                     self.cum_lengths = [0, shape[0]]
 
-            self.length = self.cum_lengths[-1]
-        else: 
-        # If any matching files are found, load each one together with its shape.
-            if memmap_files:
-                for memmap_file in memmap_files:
-                    # Replace "input_ids.memmap" with "input_ids_shape.npy"
-                    shape_file = memmap_file.replace("input_ids.memmap", "input_ids_shape.npy")
-                    if not os.path.exists(shape_file):
-                        raise ValueError(f"Shape file {shape_file} not found for {memmap_file}")
-                    shape = tuple(np.load(shape_file))
-                    chunk_memmap = np.memmap(
-                        memmap_file, dtype="int32", mode="r", shape=shape
-                    )
-                    self.chunks.append(chunk_memmap)
-                    self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
-                self.length = self.cum_lengths[-1]
-                print(f"Total length: {self.length}")
-                print(f"cum_lengths: {self.cum_lengths}")
-                print(f"chunks: {self.chunks}")
-            else:
-                # Fall back to the previous naming convention if no rank/partial files found.
-                chunk_idx = 0
-                self.chunks = []
-                self.cum_lengths = [0]
-                while True:
-                    memmap_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}.memmap')
-                    shape_file = os.path.join(data_path, f'{split}_input_ids_{chunk_idx}_shape.npy')
-                    if not os.path.exists(memmap_file) or not os.path.exists(shape_file):
-                        break
-                    shape = tuple(np.load(shape_file))
-                    chunk_memmap = np.memmap(
-                        memmap_file, dtype="int32", mode="r", shape=shape
-                    )
-                    self.chunks.append(chunk_memmap)
-                    self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
-                    chunk_idx += 1
-
-                if len(self.chunks) == 0:
-                    # Fallback to a single file strategy.
-                    memmap_file = os.path.join(data_path, f'{split}_input_ids.memmap')
-                    shape_file = os.path.join(data_path, f'{split}_input_ids_shape.npy')
-                    shape = tuple(np.load(shape_file))
-                    self.single_memmap = np.memmap(memmap_file, dtype='int32', mode='r', shape=shape)
-                    self.length = shape[0]
-                    self.chunks = [self.single_memmap]
-                    self.cum_lengths = [0, self.length]
-                else:
-                    self.length = self.cum_lengths[-1]
-
+        self.length = self.cum_lengths[-1]
         # Retrieve the special tokens.
         self.speech_generation_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_START|>')
         self.speech_generation_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_END|>')
@@ -426,16 +376,13 @@ def main():
         data_path=data_args.data_path,
         split="train",
         tokenizer=tokenizer,
-        from_gcs=True
         # ranks=[0, 1],
         # partials=[0, 1],
     )
     print(f"Train dataset length: {len(train_dataset)}")
     train_dataset[0]
 
-    # For evaluation, adjust as needed.
-    if os.path.exists(os.path.join(data_args.data_path, "test_input_ids.memmap")):
-        eval_dataset = TTSDataset.create_truncated_dataset(
+    eval_dataset = TTSDataset.create_truncated_dataset(
             data_path=data_args.data_path,
             split="test",
             tokenizer=tokenizer,
@@ -444,9 +391,6 @@ def main():
             # ranks=[0, 1],
             # partials=[0, 1],
         )
-    else:
-        eval_dataset = None
-
  
     data_collator = default_data_collator
 
