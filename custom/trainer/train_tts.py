@@ -30,6 +30,8 @@ from google.cloud import storage
 import tempfile
 from os import environ
 from dotenv import load_dotenv
+from pathlib import Path
+
 
 @dataclass
 class ModelArguments:
@@ -258,6 +260,15 @@ class TTSDataset(Dataset):
             'attention_mask': list(attention_mask)
         }
  
+def upload_directory_to_gcs(local_path, bucket, gcs_path):
+    local_path = Path(local_path)
+    for file_path in local_path.rglob("*"):
+        if file_path.is_file():
+            blob_path = f"{gcs_path}/{file_path.relative_to(local_path)}"
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(str(file_path))
+            print(f"Uploaded {file_path} to gs://{bucket.name}/{blob_path}")
+
 
 def main():
     load_dotenv()
@@ -448,6 +459,14 @@ def main():
  
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
+
+    storage_client = storage.Client()
+    bucket_uri = os.getenv("BUCKET_URI")
+    bucket_name, *prefix_parts = bucket_uri.replace("gs://", "").split("/")
+    prefix = "/".join(prefix_parts)
+    bucket = storage_client.bucket(bucket_name)
+
+    upload_directory_to_gcs(training_args.output_dir, bucket, prefix)
 
 if __name__ == "__main__":
     main()
