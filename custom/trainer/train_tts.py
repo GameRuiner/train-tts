@@ -75,65 +75,65 @@ class TTSDataset(Dataset):
         self.chunks = []
         self.cum_lengths = [0]
         self.temp_files = []
-        print("Loading dataset...")
-        # Use glob to search for files matching pattern for any rank and partial.
-        pattern = os.path.join(data_path, f"{split}_rank*_partial*_input_ids.memmap")
-        memmap_files = sorted(glob.glob(pattern))
-
-        print(f"Found {len(memmap_files)} matching files for {split} split")
-        print(f"memmap_files: {memmap_files}")
 
         storage_client = storage.Client()
         bucket_uri = os.getenv("BUCKET_URI")
-        bucket = storage_client.bucket(bucket_uri.replace("gs://", ""))
-            
+        bucket_name = bucket_uri.replace("gs://", "")
+        bucket = storage_client.bucket(bucket_name)
+
         idx = 0
+        # Try multi‐shard naming first
         while True:
-                memmap_blob_name = f"{split}_input_ids_{idx}.memmap"
-                shape_blob_name = f"{split}_input_ids_{idx}_shape.npy"
-                memmap_blob = bucket.blob(memmap_blob_name)
-                shape_blob = bucket.blob(shape_blob_name)
+            memmap_blob_name = f"{split}_input_ids_{idx}.memmap"
+            shape_blob_name = f"{split}_input_ids_{idx}_shape.npy"
+            memmap_blob = bucket.blob(memmap_blob_name)
+            shape_blob = bucket.blob(shape_blob_name)
+            if not memmap_blob.exists() or not shape_blob.exists():
+                break
 
-                if not memmap_blob.exists() or not shape_blob.exists():
-                    break
+            with tempfile.NamedTemporaryFile(delete=False) as shape_tmp_file:
+                shape_blob.download_to_filename(shape_tmp_file.name)
+                shape = tuple(np.load(shape_tmp_file.name))
+                self.temp_files.append(shape_tmp_file.name)
 
-                # Download shape to memory
-                with tempfile.NamedTemporaryFile(delete=False) as shape_tmp_file:
-                    shape_blob.download_to_filename(shape_tmp_file.name)
-                    shape = tuple(np.load(shape_tmp_file.name))
-                    self.temp_files.append(shape_tmp_file.name)
+            with tempfile.NamedTemporaryFile(delete=False) as memmap_tmp_file:
+                memmap_blob.download_to_filename(memmap_tmp_file.name)
+                self.temp_files.append(memmap_tmp_file.name)
+                chunk_memmap = np.memmap(
+                    memmap_tmp_file.name, dtype='int32', mode='r', shape=shape
+                )
+                self.chunks.append(chunk_memmap)
+                self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
 
-                # Download memmap file to temp and load
-                with tempfile.NamedTemporaryFile(delete=False) as memmap_tmp_file:
-                    memmap_blob.download_to_filename(memmap_tmp_file.name)
-                    self.temp_files.append(memmap_tmp_file.name)
-                    chunk_memmap = np.memmap(
-                        memmap_tmp_file.name, dtype='int32', mode='r', shape=shape
-                    )
-                    self.chunks.append(chunk_memmap)
-                    self.cum_lengths.append(self.cum_lengths[-1] + shape[0])
+            idx += 1
 
-                idx += 1
-
+        # If no multi‐shard files found, fall back to single file
         if len(self.chunks) == 0:
-                # Try single file fallback
-                memmap_blob = bucket.blob(f"{split}_input_ids.memmap")
-                shape_blob = bucket.blob(f"{split}_input_ids_shape.npy")
-                with tempfile.NamedTemporaryFile(delete=False) as shape_tmp_file:
-                    shape_blob.download_to_filename(shape_tmp_file.name)
-                    shape = tuple(np.load(shape_tmp_file.name))
-                    self.temp_files.append(shape_tmp_file.name)
+            memmap_blob_name = f"{split}_input_ids.memmap"
+            shape_blob_name = f"{split}_input_ids_shape.npy"
+            memmap_blob = bucket.blob(memmap_blob_name)
+            shape_blob = bucket.blob(shape_blob_name)
 
-                with tempfile.NamedTemporaryFile(delete=False) as memmap_tmp_file:
-                    memmap_blob.download_to_filename(memmap_tmp_file.name)
-                    self.temp_files.append(memmap_tmp_file.name)
-                    chunk_memmap = np.memmap(
-                        memmap_tmp_file.name, dtype='int32', mode='r', shape=shape
-                    )
-                    self.chunks.append(chunk_memmap)
-                    self.cum_lengths = [0, shape[0]]
+            if not memmap_blob.exists() or not shape_blob.exists():
+                raise FileNotFoundError(f"Neither multi‐shard nor single‐file blobs exist for split={split}")
+
+            with tempfile.NamedTemporaryFile(delete=False) as shape_tmp_file:
+                shape_blob.download_to_filename(shape_tmp_file.name)
+                shape = tuple(np.load(shape_tmp_file.name))
+                self.temp_files.append(shape_tmp_file.name)
+
+            with tempfile.NamedTemporaryFile(delete=False) as memmap_tmp_file:
+                memmap_blob.download_to_filename(memmap_tmp_file.name)
+                self.temp_files.append(memmap_tmp_file.name)
+                chunk_memmap = np.memmap(
+                    memmap_tmp_file.name, dtype='int32', mode='r', shape=shape
+                )
+                self.chunks.append(chunk_memmap)
+                self.cum_lengths = [0, shape[0]]
 
         self.length = self.cum_lengths[-1]
+        print(f"[DEBUG] Total {split} dataset length: {self.length}")
+
         # Retrieve the special tokens.
         self.speech_generation_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_START|>')
         self.speech_generation_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_GENERATION_END|>')
@@ -144,7 +144,7 @@ class TTSDataset(Dataset):
         self.speech_understanding_start_id = tokenizer.convert_tokens_to_ids('<|SPEECH_UNDERSTANDING_START|>')
         self.speech_understanding_end_id = tokenizer.convert_tokens_to_ids('<|SPEECH_UNDERSTANDING_END|>')
         self.max_length = 2048
-        self.ignore_index = -100  
+        self.ignore_index = -100
 
     def __len__(self):
         return self.length
