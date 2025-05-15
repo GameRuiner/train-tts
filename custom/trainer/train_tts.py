@@ -436,11 +436,6 @@ def main():
     )
     training_args.optim = (adam_bnb_optim, None)
     training_args.optimizers = (adam_bnb_optim, None)
-    ##### Optimizer #####
-
-    print("Training Parameters:")
-    print(training_args)
-    print("===========")
 
     trainer = Trainer(
         model=model,
